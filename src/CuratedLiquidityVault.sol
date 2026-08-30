@@ -11,6 +11,9 @@ import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {FixedPoint128} from "@uniswap/v4-core/src/libraries/FixedPoint128.sol";
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 
 import {ERC20} from "solmate/src/tokens/ERC20.sol";
@@ -20,17 +23,18 @@ import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 import {ICuratedLiquidityVault} from "./interfaces/ICuratedLiquidityVault.sol";
 
 /// @notice Pools token0/token1 deposits behind a single curator-managed Uniswap v4 position.
-/// @dev STAGE 4A: adds atomic rebalancing (remove the active position, redeploy into a new
-/// curator-chosen range). Still does NOT implement user withdrawals, standalone fee collection,
-/// or NAV/share-price logic — those are later stages. The vault's own shares double as the
-/// ERC-20 share token (no separate contract), matching "no unnecessary abstractions".
+/// @dev STAGE 4B.1: adds position valuation (`positionAmounts`/`pendingFees`/`totalAssets0/1`)
+/// and fee realization (`collectFees`). Still does NOT implement user withdrawals or share
+/// redemption — that is Stage 4B.2. The vault's own shares double as the ERC-20 share token (no
+/// separate contract), matching "no unnecessary abstractions".
 contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
     /// @dev Discriminates the single `unlockCallback` between the two operations that can trigger
     /// it. `data` is always constructed by the vault itself (never accepted raw from a caller), so
     /// this is not an externally-influenceable dispatch surface.
     enum Action {
         OpenPosition,
-        Rebalance
+        Rebalance,
+        CollectFees
     }
 
     /// @dev Shares permanently locked on the first deposit, mirroring Uniswap V2's `Pair.mint()`.
@@ -100,6 +104,7 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
     event PositionRemoved(
         int24 tickLower, int24 tickUpper, uint128 liquidityRemoved, uint256 amount0Received, uint256 amount1Received
     );
+    event FeesCollected(uint256 amount0, uint256 amount1);
     event Transfer(address indexed from, address indexed to, uint256 amount);
     event Approval(address indexed owner, address indexed spender, uint256 amount);
 
@@ -237,6 +242,19 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
         poolManager.unlock(abi.encode(Action.Rebalance, abi.encode(newTickLower, newTickUpper)));
     }
 
+    /// @notice Realizes accrued fees from the vault's active position into idle reserves.
+    /// @dev Permissionless: this can only ever move the vault's own already-earned fees into the
+    /// vault's own idle reserves (see `_collectFees`) — it cannot touch principal, share balances,
+    /// or the active/approved range, so there is no one it could disadvantage. A zero-liquidity
+    /// (`liquidityDelta == 0`) `modifyLiquidity` call is the current v4 mechanism for this: per
+    /// `Position.update`, the principal-delta computation is skipped entirely for a zero delta, so
+    /// the returned delta is pure fees. Safe to call when there are no fees to realize — it is
+    /// simply a no-op poke in that case.
+    function collectFees() external {
+        if (!positionActive) revert NoActivePosition();
+        poolManager.unlock(abi.encode(Action.CollectFees, bytes("")));
+    }
+
     /// @inheritdoc IUnlockCallback
     /// @dev Dispatches on an action the vault itself encoded — `data` is never accepted from an
     /// external caller, so this is not an externally-influenceable branch. Re-entering either
@@ -249,7 +267,7 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
 
         if (action == Action.OpenPosition) {
             _createPosition(approvedTickLower, approvedTickUpper);
-        } else {
+        } else if (action == Action.Rebalance) {
             (int24 newTickLower, int24 newTickUpper) = abi.decode(payload, (int24, int24));
 
             _removePosition();
@@ -259,6 +277,8 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
             emit ApprovedRangeUpdated(newTickLower, newTickUpper);
 
             _createPosition(newTickLower, newTickUpper);
+        } else {
+            _collectFees();
         }
 
         return "";
@@ -354,6 +374,110 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
             _positiveMagnitude(callerDelta.amount0()),
             _positiveMagnitude(callerDelta.amount1())
         );
+    }
+
+    /// @dev Pokes the active position (zero-liquidity `modifyLiquidity`) to realize accrued fees.
+    /// Per `Position.update`/`Pool.modifyLiquidity` (verified against pinned source), a zero
+    /// liquidityDelta skips the principal-delta computation entirely, so `callerDelta` here is
+    /// exactly the fee amounts — settled and credited to idle reserves via the same generic
+    /// helpers used everywhere else, no separate fee-specific settlement path required.
+    function _collectFees() private {
+        int24 tickLower = activeTickLower;
+        int24 tickUpper = activeTickUpper;
+
+        (BalanceDelta callerDelta,) = poolManager.modifyLiquidity(
+            _poolKey(),
+            ModifyLiquidityParams({tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: 0, salt: POSITION_SALT}),
+            ""
+        );
+
+        _settleDelta(currency0, callerDelta.amount0());
+        _settleDelta(currency1, callerDelta.amount1());
+
+        reserve0 = _applyDelta(reserve0, callerDelta.amount0());
+        reserve1 = _applyDelta(reserve1, callerDelta.amount1());
+
+        emit FeesCollected(_positiveMagnitude(callerDelta.amount0()), _positiveMagnitude(callerDelta.amount1()));
+    }
+
+    /// @notice The token amounts currently represented by the active position's principal
+    /// (excludes fees — see `pendingFees`). Zero if no position is active.
+    /// @dev Uses the LIVE liquidity and LIVE sqrt price (never the approved range, never a cached
+    /// liquidity value) — mirrors exactly the branch structure `Pool.modifyLiquidity` itself uses
+    /// (price below/inside/above the range), via `SqrtPriceMath.getAmount0/1Delta`, the same
+    /// production function PoolManager calls internally for real settlement.
+    function positionAmounts() public view returns (uint256 amount0, uint256 amount1) {
+        if (!positionActive) return (0, 0);
+
+        (uint128 liquidity,,) = StateLibrary.getPositionInfo(
+            poolManager, poolId, address(this), activeTickLower, activeTickUpper, POSITION_SALT
+        );
+        if (liquidity == 0) return (0, 0);
+
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(poolManager, poolId);
+        uint160 sqrtPriceLowerX96 = TickMath.getSqrtPriceAtTick(activeTickLower);
+        uint160 sqrtPriceUpperX96 = TickMath.getSqrtPriceAtTick(activeTickUpper);
+
+        (amount0, amount1) = _amountsForLiquidity(sqrtPriceX96, sqrtPriceLowerX96, sqrtPriceUpperX96, liquidity);
+    }
+
+    /// @notice The fees currently accrued to the active position but not yet realized into idle
+    /// reserves. Zero if no position is active. Purely a view — calling this never changes state.
+    /// @dev Replicates `Position.update`'s exact fee formula (verified against pinned source),
+    /// reading the position's cached checkpoint via `StateLibrary.getPositionInfo` and the pool's
+    /// current fee growth via `StateLibrary.getFeeGrowthInside`. The subtraction is `unchecked`
+    /// because fee-growth wraparound is intentional (same as in `Position.sol` itself), not an
+    /// error condition.
+    function pendingFees() public view returns (uint256 fees0, uint256 fees1) {
+        if (!positionActive) return (0, 0);
+
+        (uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128) = StateLibrary.getPositionInfo(
+            poolManager, poolId, address(this), activeTickLower, activeTickUpper, POSITION_SALT
+        );
+
+        (uint256 feeGrowthInside0X128, uint256 feeGrowthInside1X128) =
+            StateLibrary.getFeeGrowthInside(poolManager, poolId, activeTickLower, activeTickUpper);
+
+        unchecked {
+            fees0 = FullMath.mulDiv(feeGrowthInside0X128 - feeGrowthInside0LastX128, liquidity, FixedPoint128.Q128);
+            fees1 = FullMath.mulDiv(feeGrowthInside1X128 - feeGrowthInside1LastX128, liquidity, FixedPoint128.Q128);
+        }
+    }
+
+    /// @notice The vault's total economic token0 assets: idle reserve + live position principal +
+    /// unrealized accrued fees. Deliberately NOT combined with `totalAssets1()` into a single
+    /// value — token0 and token1 are not fungible with each other without a price conversion this
+    /// vault does not introduce.
+    function totalAssets0() external view returns (uint256) {
+        (uint256 principal0,) = positionAmounts();
+        (uint256 fees0,) = pendingFees();
+        return reserve0 + principal0 + fees0;
+    }
+
+    /// @notice The vault's total economic token1 assets — see `totalAssets0`.
+    function totalAssets1() external view returns (uint256) {
+        (, uint256 principal1) = positionAmounts();
+        (, uint256 fees1) = pendingFees();
+        return reserve1 + principal1 + fees1;
+    }
+
+    /// @dev Mirrors `Pool.modifyLiquidity`'s price-vs-range branch structure to compute the token
+    /// amounts represented by `liquidity` between two sqrt price boundaries, rounding down (never
+    /// overstating recoverable assets).
+    function _amountsForLiquidity(
+        uint160 sqrtPriceX96,
+        uint160 sqrtPriceLowerX96,
+        uint160 sqrtPriceUpperX96,
+        uint128 liquidity
+    ) private pure returns (uint256 amount0, uint256 amount1) {
+        if (sqrtPriceX96 <= sqrtPriceLowerX96) {
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtPriceLowerX96, sqrtPriceUpperX96, liquidity, false);
+        } else if (sqrtPriceX96 < sqrtPriceUpperX96) {
+            amount0 = SqrtPriceMath.getAmount0Delta(sqrtPriceX96, sqrtPriceUpperX96, liquidity, false);
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtPriceLowerX96, sqrtPriceX96, liquidity, false);
+        } else {
+            amount1 = SqrtPriceMath.getAmount1Delta(sqrtPriceLowerX96, sqrtPriceUpperX96, liquidity, false);
+        }
     }
 
     /// @notice The vault's single `PoolKey`, reassembled from its immutable components.
