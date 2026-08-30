@@ -20,11 +20,19 @@ import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 import {ICuratedLiquidityVault} from "./interfaces/ICuratedLiquidityVault.sol";
 
 /// @notice Pools token0/token1 deposits behind a single curator-managed Uniswap v4 position.
-/// @dev STAGE 3: adds the ability to deploy idle reserves into exactly one real PoolManager
-/// position. Still does NOT implement withdrawals, partial removal, rebalancing, or fee
-/// collection/pokes — those are later stages. The vault's own shares double as the ERC-20 share
-/// token (no separate contract), matching "no unnecessary abstractions".
+/// @dev STAGE 4A: adds atomic rebalancing (remove the active position, redeploy into a new
+/// curator-chosen range). Still does NOT implement user withdrawals, standalone fee collection,
+/// or NAV/share-price logic — those are later stages. The vault's own shares double as the
+/// ERC-20 share token (no separate contract), matching "no unnecessary abstractions".
 contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
+    /// @dev Discriminates the single `unlockCallback` between the two operations that can trigger
+    /// it. `data` is always constructed by the vault itself (never accepted raw from a caller), so
+    /// this is not an externally-influenceable dispatch surface.
+    enum Action {
+        OpenPosition,
+        Rebalance
+    }
+
     /// @dev Shares permanently locked on the first deposit, mirroring Uniswap V2's `Pair.mint()`.
     /// Forces a minimum real stake before shares are usable, closing the classic
     /// mint-1-wei-then-donate first-depositor manipulation.
@@ -89,6 +97,9 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
     event Deposit(address indexed depositor, uint256 amount0, uint256 amount1, uint256 shares);
     event ApprovedRangeUpdated(int24 tickLower, int24 tickUpper);
     event PositionOpened(int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 amount0Paid, uint256 amount1Paid);
+    event PositionRemoved(
+        int24 tickLower, int24 tickUpper, uint128 liquidityRemoved, uint256 amount0Received, uint256 amount1Received
+    );
     event Transfer(address indexed from, address indexed to, uint256 amount);
     event Approval(address indexed owner, address indexed spender, uint256 amount);
 
@@ -104,7 +115,9 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
     error NotPoolManager(address caller);
     error PositionAlreadyActive();
     error PositionActive();
+    error NoActivePosition();
     error ZeroLiquidity();
+    error PositionNotFullyRemoved(uint128 remainingLiquidity);
     error TransferToZeroAddress();
     error InsufficientBalance();
     error InsufficientAllowance();
@@ -207,21 +220,54 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
         if (msg.sender != curator) revert NotCurator(msg.sender);
         if (positionActive) revert PositionAlreadyActive();
 
-        poolManager.unlock("");
+        poolManager.unlock(abi.encode(Action.OpenPosition, bytes("")));
+    }
+
+    /// @notice Atomically moves the vault's single position to a new curator-chosen range:
+    /// removes all liquidity from the current position, updates the approved range, then
+    /// redeploys the recovered (plus any already-idle) assets into the new range.
+    /// @dev The curator must explicitly choose the destination range every time — there is no
+    /// path that updates `approvedRange()` without also moving the real position in the same
+    /// transaction, and no path that moves the position without the caller having chosen where.
+    function rebalance(int24 newTickLower, int24 newTickUpper) external {
+        if (msg.sender != curator) revert NotCurator(msg.sender);
+        if (!positionActive) revert NoActivePosition();
+        if (newTickLower >= newTickUpper) revert InvalidRange(newTickLower, newTickUpper);
+
+        poolManager.unlock(abi.encode(Action.Rebalance, abi.encode(newTickLower, newTickUpper)));
     }
 
     /// @inheritdoc IUnlockCallback
-    /// @dev The only reachable action in this stage is opening the vault's single position — it
-    /// is unconditional here because `openPosition` already gates `positionActive` before ever
-    /// calling `unlock`, and PoolManager's own single-unlock-per-call lock (`AlreadyUnlocked`)
-    /// independently prevents this from being re-entered mid-callback. The `data` parameter is
-    /// intentionally ignored: nothing about this operation is caller-configurable.
-    function unlockCallback(bytes calldata) external returns (bytes memory) {
+    /// @dev Dispatches on an action the vault itself encoded — `data` is never accepted from an
+    /// external caller, so this is not an externally-influenceable branch. Re-entering either
+    /// `openPosition` or `rebalance` mid-callback would call `poolManager.unlock` a second time,
+    /// which PoolManager itself rejects (`AlreadyUnlocked`) independently of any state here.
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert NotPoolManager(msg.sender);
 
-        int24 tickLower = approvedTickLower;
-        int24 tickUpper = approvedTickUpper;
+        (Action action, bytes memory payload) = abi.decode(data, (Action, bytes));
 
+        if (action == Action.OpenPosition) {
+            _createPosition(approvedTickLower, approvedTickUpper);
+        } else {
+            (int24 newTickLower, int24 newTickUpper) = abi.decode(payload, (int24, int24));
+
+            _removePosition();
+
+            approvedTickLower = newTickLower;
+            approvedTickUpper = newTickUpper;
+            emit ApprovedRangeUpdated(newTickLower, newTickUpper);
+
+            _createPosition(newTickLower, newTickUpper);
+        }
+
+        return "";
+    }
+
+    /// @dev Deploys currently-idle reserves into a brand new position at `[tickLower, tickUpper]`.
+    /// Shared by `openPosition` (position didn't exist) and `rebalance` (position was just
+    /// removed) — both must go through the exact same mechanism.
+    function _createPosition(int24 tickLower, int24 tickUpper) private {
         (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(poolManager, poolId);
         uint160 sqrtPriceLowerX96 = TickMath.getSqrtPriceAtTick(tickLower);
         uint160 sqrtPriceUpperX96 = TickMath.getSqrtPriceAtTick(tickUpper);
@@ -244,22 +290,70 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
             ""
         );
 
-        uint256 amount0Paid = _settleDelta(currency0, callerDelta.amount0());
-        uint256 amount1Paid = _settleDelta(currency1, callerDelta.amount1());
+        _settleDelta(currency0, callerDelta.amount0());
+        _settleDelta(currency1, callerDelta.amount1());
 
         // Reserves fall by exactly what PoolManager actually charged — never by `idle0`/`idle1`,
         // since getLiquidityForAmounts may not have needed the full amount on one side (e.g. the
         // range only partially overlaps the current price). Any unused amount stays idle.
-        reserve0 = idle0 - amount0Paid;
-        reserve1 = idle1 - amount1Paid;
+        reserve0 = _applyDelta(idle0, callerDelta.amount0());
+        reserve1 = _applyDelta(idle1, callerDelta.amount1());
 
         positionActive = true;
         activeTickLower = tickLower;
         activeTickUpper = tickUpper;
 
-        emit PositionOpened(tickLower, tickUpper, liquidity, amount0Paid, amount1Paid);
+        emit PositionOpened(
+            tickLower,
+            tickUpper,
+            liquidity,
+            _negativeMagnitude(callerDelta.amount0()),
+            _negativeMagnitude(callerDelta.amount1())
+        );
+    }
 
-        return "";
+    /// @dev Removes 100% of the vault's currently active position and credits the recovered
+    /// principal (and any accrued fees, which PoolManager already folds into the same delta) back
+    /// into idle reserves. Reads the live liquidity from PoolManager rather than trusting any
+    /// cached value, and verifies via a second live read that removal actually zeroed it out.
+    function _removePosition() private {
+        int24 tickLower = activeTickLower;
+        int24 tickUpper = activeTickUpper;
+
+        (uint128 liquidity,,) =
+            StateLibrary.getPositionInfo(poolManager, poolId, address(this), tickLower, tickUpper, POSITION_SALT);
+        if (liquidity == 0) revert ZeroLiquidity();
+
+        (BalanceDelta callerDelta,) = poolManager.modifyLiquidity(
+            _poolKey(),
+            ModifyLiquidityParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidityDelta: -int256(uint256(liquidity)),
+                salt: POSITION_SALT
+            }),
+            ""
+        );
+
+        _settleDelta(currency0, callerDelta.amount0());
+        _settleDelta(currency1, callerDelta.amount1());
+
+        reserve0 = _applyDelta(reserve0, callerDelta.amount0());
+        reserve1 = _applyDelta(reserve1, callerDelta.amount1());
+
+        (uint128 remainingLiquidity,,) =
+            StateLibrary.getPositionInfo(poolManager, poolId, address(this), tickLower, tickUpper, POSITION_SALT);
+        if (remainingLiquidity != 0) revert PositionNotFullyRemoved(remainingLiquidity);
+
+        positionActive = false;
+
+        emit PositionRemoved(
+            tickLower,
+            tickUpper,
+            liquidity,
+            _positiveMagnitude(callerDelta.amount0()),
+            _positiveMagnitude(callerDelta.amount1())
+        );
     }
 
     /// @notice The vault's single `PoolKey`, reassembled from its immutable components.
@@ -282,17 +376,34 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
     }
 
     /// @dev Settles one side of a PoolManager delta per the verified sign convention: negative
-    /// means the vault owes PoolManager (sync, transfer, settle); positive means PoolManager owes
-    /// the vault (take); zero needs nothing. Returns the amount paid (0 if owed or unowed).
-    function _settleDelta(Currency currency, int128 delta) private returns (uint256 amountPaid) {
+    /// means the vault owes PoolManager (sync, transfer, settle) — the case for adding liquidity;
+    /// positive means PoolManager owes the vault (take) — the case for removing liquidity, where
+    /// principal and any accrued fees arrive together in the same delta; zero needs nothing.
+    function _settleDelta(Currency currency, int128 delta) private {
         if (delta < 0) {
-            amountPaid = uint256(uint128(-delta));
+            uint256 amountOwed = uint256(uint128(-delta));
             poolManager.sync(currency);
-            SafeTransferLib.safeTransfer(ERC20(Currency.unwrap(currency)), address(poolManager), amountPaid);
+            SafeTransferLib.safeTransfer(ERC20(Currency.unwrap(currency)), address(poolManager), amountOwed);
             poolManager.settle();
         } else if (delta > 0) {
             poolManager.take(currency, address(this), uint256(uint128(delta)));
         }
+    }
+
+    /// @dev Applies a settled `BalanceDelta` side to a reserve/balance amount: a negative delta
+    /// (paid out) subtracts, a positive delta (received) adds, zero is a no-op.
+    function _applyDelta(uint256 base, int128 delta) private pure returns (uint256) {
+        if (delta < 0) return base - uint256(uint128(-delta));
+        if (delta > 0) return base + uint256(uint128(delta));
+        return base;
+    }
+
+    function _positiveMagnitude(int128 delta) private pure returns (uint256) {
+        return delta > 0 ? uint256(uint128(delta)) : 0;
+    }
+
+    function _negativeMagnitude(int128 delta) private pure returns (uint256) {
+        return delta < 0 ? uint256(uint128(-delta)) : 0;
     }
 
     function transfer(address to, uint256 amount) external returns (bool) {
