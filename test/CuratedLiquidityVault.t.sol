@@ -8,7 +8,7 @@ import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
-import {FixedPointMathLib} from "solmate/utils/FixedPointMathLib.sol";
+import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 
 import {CuratedLiquidityVault} from "../src/CuratedLiquidityVault.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -296,15 +296,13 @@ contract CuratedLiquidityVaultTest is Test {
     }
 
     // ── 15. Unauthorized unlockCallback ──────────────────────────────────────
+    // (The authorized/real-PoolManager path is now covered in
+    // CuratedLiquidityVaultLiquidityTest, which deploys against a real PoolManager — this mock
+    // `POOL_MANAGER` address has no code, so it can no longer stand in for a successful call now
+    // that `unlockCallback` performs real PoolManager reads.)
 
     function test_unlockCallback_notPoolManager_reverts() public {
         vm.expectRevert(abi.encodeWithSelector(CuratedLiquidityVault.NotPoolManager.selector, address(this)));
-        vault.unlockCallback("");
-    }
-
-    function test_unlockCallback_asPoolManager_revertsNotImplemented() public {
-        vm.prank(POOL_MANAGER);
-        vm.expectRevert(CuratedLiquidityVault.LiquidityManagementNotImplemented.selector);
         vault.unlockCallback("");
     }
 

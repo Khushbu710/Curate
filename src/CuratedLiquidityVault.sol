@@ -7,18 +7,23 @@ import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 
-import {ERC20} from "solmate/tokens/ERC20.sol";
-import {SafeTransferLib} from "solmate/utils/SafeTransferLib.sol";
-import {FixedPointMathLib} from "solmate/utils/FixedPointMathLib.sol";
+import {ERC20} from "solmate/src/tokens/ERC20.sol";
+import {SafeTransferLib} from "solmate/src/utils/SafeTransferLib.sol";
+import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 
 import {ICuratedLiquidityVault} from "./interfaces/ICuratedLiquidityVault.sol";
 
 /// @notice Pools token0/token1 deposits behind a single curator-managed Uniswap v4 position.
-/// @dev STAGE 2: covers configuration, curator range updates, deposits, and the ERC-20 share
-/// token. Deliberately does NOT deploy liquidity, rebalance, withdraw, or collect fees yet — see
-/// `unlockCallback`. The vault's own shares double as the ERC-20 share token (no separate
-/// contract), matching "no unnecessary abstractions".
+/// @dev STAGE 3: adds the ability to deploy idle reserves into exactly one real PoolManager
+/// position. Still does NOT implement withdrawals, partial removal, rebalancing, or fee
+/// collection/pokes — those are later stages. The vault's own shares double as the ERC-20 share
+/// token (no separate contract), matching "no unnecessary abstractions".
 contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
     /// @dev Shares permanently locked on the first deposit, mirroring Uniswap V2's `Pair.mint()`.
     /// Forces a minimum real stake before shares are usable, closing the classic
@@ -54,9 +59,26 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
     int24 public approvedTickLower;
     int24 public approvedTickUpper;
 
-    /// @notice Internally tracked deposited balances used for share pricing. Deliberately NOT
-    /// live `token.balanceOf(this)`: a bare ERC-20 `transfer()` straight to this contract must not
-    /// be able to move share pricing, since nothing minted shares for it.
+    /// @notice Whether the vault's single Uniswap v4 position currently exists.
+    /// @dev `approvedTickLower/Upper` is configuration/intent; this — together with
+    /// `activeTickLower/Upper` below — is the actual PoolManager position's state. They are not
+    /// the same thing and must never be conflated: `approvedRange()` can change at any time (see
+    /// `updateApprovedRange`), but that alone never moves the real position.
+    bool public positionActive;
+
+    /// @notice The range the vault's single position actually occupies on PoolManager, snapshotted
+    /// at the moment it was opened. Only meaningful when `positionActive` is true.
+    int24 public activeTickLower;
+    int24 public activeTickUpper;
+
+    /// @dev Every position this vault ever opens uses the same salt — there is only ever one.
+    bytes32 private constant POSITION_SALT = bytes32(0);
+
+    /// @notice Internally tracked idle (undeployed) balances used for share pricing. Deliberately
+    /// NOT live `token.balanceOf(this)`: a bare ERC-20 `transfer()` straight to this contract must
+    /// not be able to move share pricing, since nothing minted shares for it. Decremented only by
+    /// the exact amount actually paid into the position (from the settled `BalanceDelta`), never
+    /// by whatever amount the liquidity math was merely offered.
     uint256 public reserve0;
     uint256 public reserve1;
 
@@ -66,6 +88,7 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
 
     event Deposit(address indexed depositor, uint256 amount0, uint256 amount1, uint256 shares);
     event ApprovedRangeUpdated(int24 tickLower, int24 tickUpper);
+    event PositionOpened(int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 amount0Paid, uint256 amount1Paid);
     event Transfer(address indexed from, address indexed to, uint256 amount);
     event Approval(address indexed owner, address indexed spender, uint256 amount);
 
@@ -79,31 +102,33 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
     error InsufficientInitialLiquidity();
     error ZeroSharesMinted();
     error NotPoolManager(address caller);
-    error LiquidityManagementNotImplemented();
+    error PositionAlreadyActive();
+    error PositionActive();
+    error ZeroLiquidity();
     error TransferToZeroAddress();
     error InsufficientBalance();
     error InsufficientAllowance();
 
     constructor(
         IPoolManager _poolManager,
-        PoolKey memory _poolKey,
+        PoolKey memory initialPoolKey,
         address _curator,
         int24 _initialTickLower,
         int24 _initialTickUpper
     ) {
         if (address(_poolManager) == address(0)) revert ZeroPoolManagerAddress();
         if (_curator == address(0)) revert ZeroCuratorAddress();
-        if (Currency.unwrap(_poolKey.currency0) == address(0)) revert ZeroCurrencyAddress();
-        if (Currency.unwrap(_poolKey.currency1) == address(0)) revert ZeroCurrencyAddress();
+        if (Currency.unwrap(initialPoolKey.currency0) == address(0)) revert ZeroCurrencyAddress();
+        if (Currency.unwrap(initialPoolKey.currency1) == address(0)) revert ZeroCurrencyAddress();
         if (_initialTickLower >= _initialTickUpper) revert InvalidRange(_initialTickLower, _initialTickUpper);
 
         poolManager = _poolManager;
-        currency0 = _poolKey.currency0;
-        currency1 = _poolKey.currency1;
-        fee = _poolKey.fee;
-        tickSpacing = _poolKey.tickSpacing;
-        hooks = _poolKey.hooks;
-        poolId = _poolKey.toId();
+        currency0 = initialPoolKey.currency0;
+        currency1 = initialPoolKey.currency1;
+        fee = initialPoolKey.fee;
+        tickSpacing = initialPoolKey.tickSpacing;
+        hooks = initialPoolKey.hooks;
+        poolId = initialPoolKey.toId();
         curator = _curator;
 
         approvedTickLower = _initialTickLower;
@@ -115,11 +140,14 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
         return (approvedTickLower, approvedTickUpper);
     }
 
-    /// @notice Updates the curator-approved range. Does NOT move any liquidity — no position
-    /// exists yet at this stage, and even once one does, this function must remain pure
-    /// configuration; moving liquidity is a separate, explicit rebalance action in a later stage.
+    /// @notice Updates the curator-approved range. Does NOT move any liquidity.
+    /// @dev Only callable while no position exists (`positionActive == false`). Once a position
+    /// is open, `approvedTickLower/Upper` and `activeTickLower/Upper` must stay identical — a
+    /// live position can only ever be moved by an explicit rebalance action (a later stage), never
+    /// by silently letting configuration drift out from under it.
     function updateApprovedRange(int24 newTickLower, int24 newTickUpper) external {
         if (msg.sender != curator) revert NotCurator(msg.sender);
+        if (positionActive) revert PositionActive();
         if (newTickLower >= newTickUpper) revert InvalidRange(newTickLower, newTickUpper);
         approvedTickLower = newTickLower;
         approvedTickUpper = newTickUpper;
@@ -171,13 +199,100 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
         return Currency.unwrap(currency1);
     }
 
+    /// @notice Deploys the vault's idle reserves into its single Uniswap v4 position, at the
+    /// currently approved range. Curator-only; can only ever create the position once.
+    /// @dev Takes no range parameters — it always uses `approvedTickLower/Upper` at the moment of
+    /// the call, never an arbitrary caller-supplied range.
+    function openPosition() external {
+        if (msg.sender != curator) revert NotCurator(msg.sender);
+        if (positionActive) revert PositionAlreadyActive();
+
+        poolManager.unlock("");
+    }
+
     /// @inheritdoc IUnlockCallback
-    /// @dev Liquidity management does not exist yet (STAGE 2). This still checks the caller
-    /// first, so an unauthorized address gets a distinct, meaningful revert rather than relying
-    /// on "no logic exists" as an accidental substitute for access control.
-    function unlockCallback(bytes calldata) external view returns (bytes memory) {
+    /// @dev The only reachable action in this stage is opening the vault's single position — it
+    /// is unconditional here because `openPosition` already gates `positionActive` before ever
+    /// calling `unlock`, and PoolManager's own single-unlock-per-call lock (`AlreadyUnlocked`)
+    /// independently prevents this from being re-entered mid-callback. The `data` parameter is
+    /// intentionally ignored: nothing about this operation is caller-configurable.
+    function unlockCallback(bytes calldata) external returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert NotPoolManager(msg.sender);
-        revert LiquidityManagementNotImplemented();
+
+        int24 tickLower = approvedTickLower;
+        int24 tickUpper = approvedTickUpper;
+
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(poolManager, poolId);
+        uint160 sqrtPriceLowerX96 = TickMath.getSqrtPriceAtTick(tickLower);
+        uint160 sqrtPriceUpperX96 = TickMath.getSqrtPriceAtTick(tickUpper);
+
+        uint256 idle0 = reserve0;
+        uint256 idle1 = reserve1;
+
+        uint128 liquidity =
+            LiquidityAmounts.getLiquidityForAmounts(sqrtPriceX96, sqrtPriceLowerX96, sqrtPriceUpperX96, idle0, idle1);
+        if (liquidity == 0) revert ZeroLiquidity();
+
+        (BalanceDelta callerDelta,) = poolManager.modifyLiquidity(
+            _poolKey(),
+            ModifyLiquidityParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidityDelta: int256(uint256(liquidity)),
+                salt: POSITION_SALT
+            }),
+            ""
+        );
+
+        uint256 amount0Paid = _settleDelta(currency0, callerDelta.amount0());
+        uint256 amount1Paid = _settleDelta(currency1, callerDelta.amount1());
+
+        // Reserves fall by exactly what PoolManager actually charged — never by `idle0`/`idle1`,
+        // since getLiquidityForAmounts may not have needed the full amount on one side (e.g. the
+        // range only partially overlaps the current price). Any unused amount stays idle.
+        reserve0 = idle0 - amount0Paid;
+        reserve1 = idle1 - amount1Paid;
+
+        positionActive = true;
+        activeTickLower = tickLower;
+        activeTickUpper = tickUpper;
+
+        emit PositionOpened(tickLower, tickUpper, liquidity, amount0Paid, amount1Paid);
+
+        return "";
+    }
+
+    /// @notice The vault's single `PoolKey`, reassembled from its immutable components.
+    function poolKey() external view returns (PoolKey memory) {
+        return _poolKey();
+    }
+
+    /// @notice The live liquidity of the vault's position, read directly from PoolManager.
+    /// @dev Deliberately not cached in vault storage — PoolManager is the only source of truth
+    /// for this value, and caching it here would risk drifting from reality once a future
+    /// rebalance/withdraw stage can change it.
+    function positionLiquidity() external view returns (uint128 liquidity) {
+        (liquidity,,) = StateLibrary.getPositionInfo(
+            poolManager, poolId, address(this), activeTickLower, activeTickUpper, POSITION_SALT
+        );
+    }
+
+    function _poolKey() private view returns (PoolKey memory) {
+        return PoolKey({currency0: currency0, currency1: currency1, fee: fee, tickSpacing: tickSpacing, hooks: hooks});
+    }
+
+    /// @dev Settles one side of a PoolManager delta per the verified sign convention: negative
+    /// means the vault owes PoolManager (sync, transfer, settle); positive means PoolManager owes
+    /// the vault (take); zero needs nothing. Returns the amount paid (0 if owed or unowed).
+    function _settleDelta(Currency currency, int128 delta) private returns (uint256 amountPaid) {
+        if (delta < 0) {
+            amountPaid = uint256(uint128(-delta));
+            poolManager.sync(currency);
+            SafeTransferLib.safeTransfer(ERC20(Currency.unwrap(currency)), address(poolManager), amountPaid);
+            poolManager.settle();
+        } else if (delta > 0) {
+            poolManager.take(currency, address(this), uint256(uint128(delta)));
+        }
     }
 
     function transfer(address to, uint256 amount) external returns (bool) {
