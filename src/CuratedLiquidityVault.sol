@@ -23,10 +23,11 @@ import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 import {ICuratedLiquidityVault} from "./interfaces/ICuratedLiquidityVault.sol";
 
 /// @notice Pools token0/token1 deposits behind a single curator-managed Uniswap v4 position.
-/// @dev STAGE 4B.1: adds position valuation (`positionAmounts`/`pendingFees`/`totalAssets0/1`)
-/// and fee realization (`collectFees`). Still does NOT implement user withdrawals or share
-/// redemption — that is Stage 4B.2. The vault's own shares double as the ERC-20 share token (no
-/// separate contract), matching "no unnecessary abstractions".
+/// @dev STAGE 4B.2: adds user withdrawals (`withdraw`) — proportional redemption against total
+/// economic assets (idle + live position principal + pending fees), with partial LP removal,
+/// slippage protection, and correct last-shareholder/MINIMUM_LIQUIDITY handling. The vault's own
+/// shares double as the ERC-20 share token (no separate contract), matching "no unnecessary
+/// abstractions".
 contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
     /// @dev Discriminates the single `unlockCallback` between the two operations that can trigger
     /// it. `data` is always constructed by the vault itself (never accepted raw from a caller), so
@@ -34,7 +35,8 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
     enum Action {
         OpenPosition,
         Rebalance,
-        CollectFees
+        CollectFees,
+        Withdraw
     }
 
     /// @dev Shares permanently locked on the first deposit, mirroring Uniswap V2's `Pair.mint()`.
@@ -105,6 +107,7 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
         int24 tickLower, int24 tickUpper, uint128 liquidityRemoved, uint256 amount0Received, uint256 amount1Received
     );
     event FeesCollected(uint256 amount0, uint256 amount1);
+    event Withdraw(address indexed owner, uint256 sharesBurned, uint256 amount0, uint256 amount1);
     event Transfer(address indexed from, address indexed to, uint256 amount);
     event Approval(address indexed owner, address indexed spender, uint256 amount);
 
@@ -126,6 +129,10 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
     error TransferToZeroAddress();
     error InsufficientBalance();
     error InsufficientAllowance();
+    error ZeroWithdrawal();
+    error ZeroPayout();
+    error SlippageExceeded(uint256 amount0, uint256 minAmount0, uint256 amount1, uint256 minAmount1);
+    error InsufficientVaultAssets(uint256 requested0, uint256 available0, uint256 requested1, uint256 available1);
 
     constructor(
         IPoolManager _poolManager,
@@ -255,6 +262,54 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
         poolManager.unlock(abi.encode(Action.CollectFees, bytes("")));
     }
 
+    /// @notice Burns the caller's shares and pays out their proportional claim on the vault's
+    /// total economic assets (idle + live position principal + pending fees).
+    /// @dev `minAmount0`/`minAmount1` are the caller's slippage protection against price movement
+    /// between transaction construction and execution — see contract-level design notes for why
+    /// no deadline is added. Reverts `ZeroPayout` rather than burning shares for nothing if the
+    /// computed claim rounds to zero on both sides.
+    function withdraw(uint256 sharesToBurn, uint256 minAmount0, uint256 minAmount1)
+        external
+        returns (uint256 amount0, uint256 amount1)
+    {
+        if (sharesToBurn == 0) revert ZeroWithdrawal();
+        if (balanceOf[msg.sender] < sharesToBurn) revert InsufficientBalance();
+
+        uint256 _totalSupply = totalSupply;
+
+        // Floors, favoring the vault (remaining shareholders) over the withdrawing caller.
+        amount0 = FixedPointMathLib.mulDivDown(totalAssets0(), sharesToBurn, _totalSupply);
+        amount1 = FixedPointMathLib.mulDivDown(totalAssets1(), sharesToBurn, _totalSupply);
+        if (amount0 == 0 && amount1 == 0) revert ZeroPayout();
+        if (amount0 < minAmount0 || amount1 < minAmount1) {
+            revert SlippageExceeded(amount0, minAmount0, amount1, minAmount1);
+        }
+
+        uint128 liquidityToRemove;
+        if (positionActive) {
+            (uint128 liveLiquidity,,) = StateLibrary.getPositionInfo(
+                poolManager, poolId, address(this), activeTickLower, activeTickUpper, POSITION_SALT
+            );
+            // The final withdrawal that would leave only the permanently-locked MINIMUM_LIQUIDITY
+            // circulating must remove the ENTIRE live position, not the floored proportional
+            // fraction — otherwise a permanent, un-removable liquidity dust sliver would remain
+            // forever and `positionActive` could never return to false.
+            liquidityToRemove = (sharesToBurn == _totalSupply - MINIMUM_LIQUIDITY)
+                ? liveLiquidity
+                : uint128(FixedPointMathLib.mulDivDown(liveLiquidity, sharesToBurn, _totalSupply));
+        }
+
+        _burn(msg.sender, sharesToBurn);
+
+        if (positionActive) {
+            poolManager.unlock(abi.encode(Action.Withdraw, abi.encode(msg.sender, amount0, amount1, liquidityToRemove)));
+        } else {
+            _payout(msg.sender, amount0, amount1);
+        }
+
+        emit Withdraw(msg.sender, sharesToBurn, amount0, amount1);
+    }
+
     /// @inheritdoc IUnlockCallback
     /// @dev Dispatches on an action the vault itself encoded — `data` is never accepted from an
     /// external caller, so this is not an externally-influenceable branch. Re-entering either
@@ -277,8 +332,13 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
             emit ApprovedRangeUpdated(newTickLower, newTickUpper);
 
             _createPosition(newTickLower, newTickUpper);
-        } else {
+        } else if (action == Action.CollectFees) {
             _collectFees();
+        } else {
+            (address recipient, uint256 amount0, uint256 amount1, uint128 liquidityToRemove) =
+                abi.decode(payload, (address, uint256, uint256, uint128));
+            _withdrawFromPosition(liquidityToRemove);
+            _payout(recipient, amount0, amount1);
         }
 
         return "";
@@ -400,6 +460,55 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
         emit FeesCollected(_positiveMagnitude(callerDelta.amount0()), _positiveMagnitude(callerDelta.amount1()));
     }
 
+    /// @dev Removes exactly `liquidityToRemove` from the active position (which may be `0` — a
+    /// valid poke that still realizes full pending fees, per `Position.update`) and credits
+    /// whatever PoolManager returns (principal slice + full fees, per the verified fee mechanics)
+    /// into idle reserves. Unlike `_removePosition` (Stage 4A, which always fully drains and
+    /// requires the result to be zero), this only flips `positionActive` false when the live
+    /// liquidity genuinely reaches zero — a partial withdrawal must leave the position active with
+    /// its remaining liquidity, range, and PoolManager ownership untouched.
+    function _withdrawFromPosition(uint128 liquidityToRemove) private {
+        int24 tickLower = activeTickLower;
+        int24 tickUpper = activeTickUpper;
+
+        (BalanceDelta callerDelta,) = poolManager.modifyLiquidity(
+            _poolKey(),
+            ModifyLiquidityParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidityDelta: -int256(uint256(liquidityToRemove)),
+                salt: POSITION_SALT
+            }),
+            ""
+        );
+
+        _settleDelta(currency0, callerDelta.amount0());
+        _settleDelta(currency1, callerDelta.amount1());
+
+        reserve0 = _applyDelta(reserve0, callerDelta.amount0());
+        reserve1 = _applyDelta(reserve1, callerDelta.amount1());
+
+        (uint128 remainingLiquidity,,) =
+            StateLibrary.getPositionInfo(poolManager, poolId, address(this), tickLower, tickUpper, POSITION_SALT);
+        if (remainingLiquidity == 0) {
+            positionActive = false;
+        }
+    }
+
+    /// @dev Pays `amount0`/`amount1` to `to` out of idle reserves. Reverts rather than ever
+    /// paying out more than the vault actually holds — a defensive invariant, not merely an
+    /// expected outcome (see contract-level design notes: both the claim and the liquidity slice
+    /// removed for it are floored in the vault's favor, so this should never trigger in practice).
+    function _payout(address to, uint256 amount0, uint256 amount1) private {
+        if (amount0 > reserve0 || amount1 > reserve1) {
+            revert InsufficientVaultAssets(amount0, reserve0, amount1, reserve1);
+        }
+        reserve0 -= amount0;
+        reserve1 -= amount1;
+        if (amount0 > 0) SafeTransferLib.safeTransfer(ERC20(Currency.unwrap(currency0)), to, amount0);
+        if (amount1 > 0) SafeTransferLib.safeTransfer(ERC20(Currency.unwrap(currency1)), to, amount1);
+    }
+
     /// @notice The token amounts currently represented by the active position's principal
     /// (excludes fees — see `pendingFees`). Zero if no position is active.
     /// @dev Uses the LIVE liquidity and LIVE sqrt price (never the approved range, never a cached
@@ -448,14 +557,14 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
     /// unrealized accrued fees. Deliberately NOT combined with `totalAssets1()` into a single
     /// value — token0 and token1 are not fungible with each other without a price conversion this
     /// vault does not introduce.
-    function totalAssets0() external view returns (uint256) {
+    function totalAssets0() public view returns (uint256) {
         (uint256 principal0,) = positionAmounts();
         (uint256 fees0,) = pendingFees();
         return reserve0 + principal0 + fees0;
     }
 
     /// @notice The vault's total economic token1 assets — see `totalAssets0`.
-    function totalAssets1() external view returns (uint256) {
+    function totalAssets1() public view returns (uint256) {
         (, uint256 principal1) = positionAmounts();
         (, uint256 fees1) = pendingFees();
         return reserve1 + principal1 + fees1;
@@ -566,6 +675,12 @@ contract CuratedLiquidityVault is ICuratedLiquidityVault, IUnlockCallback {
         totalSupply += amount;
         balanceOf[to] += amount;
         emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) private {
+        balanceOf[from] -= amount;
+        totalSupply -= amount;
+        emit Transfer(from, address(0), amount);
     }
 
     /// @dev Babylonian-method integer square root, identical to Uniswap V2's `Math.sqrt`.
