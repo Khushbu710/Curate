@@ -92,7 +92,9 @@ contract CuratedLiquidityVaultRebalanceTest is Test {
         );
         address predictedVault = vm.computeCreate2Address(vaultSalt, keccak256(vaultCreationCode), address(this));
 
-        bytes memory hookArgs = abi.encode(poolManager, predictedVault, poolId);
+        bytes memory hookArgs = abi.encode(
+            poolManager, predictedVault, poolKey.currency0, poolKey.currency1, poolKey.fee, poolKey.tickSpacing
+        );
         deployCodeTo("CuratedLiquidityHook.sol:CuratedLiquidityHook", hookArgs, hookAddress);
         hook = CuratedLiquidityHook(hookAddress);
 

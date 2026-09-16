@@ -38,7 +38,14 @@ contract CuratedLiquidityHookTest is Test {
         });
         poolId = poolKey.toId();
 
-        bytes memory constructorArgs = abi.encode(IPoolManager(POOL_MANAGER), address(vault), poolId);
+        bytes memory constructorArgs = abi.encode(
+            IPoolManager(POOL_MANAGER),
+            address(vault),
+            poolKey.currency0,
+            poolKey.currency1,
+            poolKey.fee,
+            poolKey.tickSpacing
+        );
         deployCodeTo("CuratedLiquidityHook.sol:CuratedLiquidityHook", constructorArgs, _hookAddress());
         hook = CuratedLiquidityHook(_hookAddress());
     }

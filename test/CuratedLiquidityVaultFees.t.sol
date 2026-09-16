@@ -109,7 +109,9 @@ contract CuratedLiquidityVaultFeesTest is Test {
         );
         address predictedVault = vm.computeCreate2Address(vaultSalt, keccak256(vaultCreationCode), address(this));
 
-        bytes memory hookArgs = abi.encode(poolManager, predictedVault, poolId);
+        bytes memory hookArgs = abi.encode(
+            poolManager, predictedVault, poolKey.currency0, poolKey.currency1, poolKey.fee, poolKey.tickSpacing
+        );
         deployCodeTo("CuratedLiquidityHook.sol:CuratedLiquidityHook", hookArgs, hookAddress);
         hook = CuratedLiquidityHook(hookAddress);
 
@@ -445,5 +447,13 @@ contract CuratedLiquidityVaultFeesTest is Test {
         _generateFeesViaRealSwap();
         vault.collectFees();
         assertEq(vault.positionLiquidity() > 0, true);
+    }
+
+    /// C. Stage 6A.1 regression: the hook's self-derived poolId must equal the vault's own
+    /// poolId — both are computed from the exact same PoolKey (the hook derives it from
+    /// address(this) at construction; the vault derives it from the PoolKey it was given). If
+    /// these ever diverged, every hook range check would revert with WrongPool.
+    function test_hookPoolId_matchesVaultPoolId() public view {
+        assertEq(PoolId.unwrap(hook.poolId()), PoolId.unwrap(vault.poolId()), "hook and vault must agree on poolId");
     }
 }

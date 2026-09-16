@@ -7,6 +7,7 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
 import {ICuratedLiquidityVault} from "./interfaces/ICuratedLiquidityVault.sol";
@@ -35,10 +36,32 @@ contract CuratedLiquidityHook is BaseHook {
     /// @notice Thrown when the vault address supplied at construction is the zero address.
     error ZeroVaultAddress();
 
-    constructor(IPoolManager _poolManager, address _vault, PoolId _poolId) BaseHook(_poolManager) {
+    /// @dev Deliberately takes the pool-defining fields rather than a precomputed `PoolId`.
+    /// `PoolId` is `keccak256(abi.encode(PoolKey))`, and `PoolKey.hooks` is this hook's own
+    /// address — accepting a precomputed `PoolId` as a constructor argument would make it part of
+    /// the CREATE2 init code hash, which is circular for `HookMiner`-style address mining (the
+    /// mined address would need to already be known to compute the very argument used to mine it).
+    /// Computing `poolId` in here instead, from `address(this)`, has no such problem: by the time
+    /// constructor code runs, `address(this)` is already the final, fully-determined address
+    /// (CREATE2's address depends only on deployer, salt, and init code hash from BEFORE
+    /// construction — never on anything a constructor does).
+    constructor(
+        IPoolManager _poolManager,
+        address _vault,
+        Currency _currency0,
+        Currency _currency1,
+        uint24 _fee,
+        int24 _tickSpacing
+    ) BaseHook(_poolManager) {
         if (_vault == address(0)) revert ZeroVaultAddress();
         vault = _vault;
-        poolId = _poolId;
+        poolId = PoolKey({
+            currency0: _currency0,
+            currency1: _currency1,
+            fee: _fee,
+            tickSpacing: _tickSpacing,
+            hooks: IHooks(address(this))
+        }).toId();
     }
 
     /// @dev Only `beforeAddLiquidity` and `beforeRemoveLiquidity` are enabled. Everything else
